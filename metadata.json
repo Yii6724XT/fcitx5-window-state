@@ -1,0 +1,8 @@
+{
+    "uuid": "fcitx5-window-state@yii",
+    "name": "Fcitx5 Per-Window Input State",
+    "description": "Manages per-window Fcitx5 input method states, bypassing Fcitx5's buggy built-in per-window state memory by acting as the compositor-level master state manager.",
+    "shell-version": ["50"],
+    "version": 1,
+    "url": "https://github.com/anomalyco/fcitx5-window-state"
+}
