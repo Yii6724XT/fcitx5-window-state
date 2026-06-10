@@ -58,6 +58,7 @@ export default class Fcitx5WindowStateExtension extends Extension {
         this._pendingIm             = null;
         this._lastKnownIM           = null;
         this._inProgrammaticSwitch  = false;
+        this._pollInFlight          = false;
         this._debounceSource        = 0;
         this._pollSource            = 0;
         this._signalIds             = [];         // global.display signal handler IDs
@@ -125,13 +126,15 @@ export default class Fcitx5WindowStateExtension extends Extension {
             this._dbg('proxy created');
 
             // Seed _lastKnownIM so the first poll doesn't trigger a false change
-            try {
-                this._lastKnownIM = String(this._proxy.CurrentInputMethodSync());
-                this._dbg(`init seed lastKnownIM="${this._lastKnownIM}"`);
-            } catch (e) {
-                this._lastKnownIM = DEFAULT_IM;
-                this._dbg(`init seed failed, fallback lastKnownIM="${DEFAULT_IM}" err=${e.message}`);
-            }
+            this._lastKnownIM = DEFAULT_IM;
+            this._proxy.CurrentInputMethodRemote((result, error) => {
+                if (!error) {
+                    this._lastKnownIM = String(result);
+                    this._dbg(`init seed lastKnownIM="${this._lastKnownIM}"`);
+                } else {
+                    this._dbg(`init seed failed: ${error.message}, using "${DEFAULT_IM}"`);
+                }
+            });
 
             // Core hook: window focus changes
             this._signalIds.push(
@@ -177,44 +180,47 @@ export default class Fcitx5WindowStateExtension extends Extension {
     //  for the currently focused window.
     // ======================================================================
     _pollCurrentIM() {
-        if (!this._proxy)
+        if (!this._proxy || this._pollInFlight)
             return;
 
-        let current;
-        try {
-            current = String(this._proxy.CurrentInputMethodSync());
-        } catch (e) {
-            this._dbg(`poll CurrentInputMethodSync ERROR: ${e.message}`);
-            return;
-        }
+        this._pollInFlight = true;
+        this._proxy.CurrentInputMethodRemote((result, error) => {
+            this._pollInFlight = false;
+            if (error) {
+                this._dbg(`poll CurrentInputMethod ERROR: ${error.message}`);
+                return;
+            }
 
-        if (current === this._lastKnownIM)
-            return; // no change
+            const current = String(result);
 
-        this._dbg(`poll DETECTED change: "${this._lastKnownIM}" -> "${current}"${this._inProgrammaticSwitch ? ' (IGNORED: inProgrammaticSwitch)' : ''}`);
+            if (current === this._lastKnownIM)
+                return; // no change
 
-        this._lastKnownIM = current;
+            this._dbg(`poll DETECTED change: "${this._lastKnownIM}" -> "${current}"${this._inProgrammaticSwitch ? ' (IGNORED: inProgrammaticSwitch)' : ''}`);
 
-        // Ignore changes that we ourselves triggered via SetCurrentIM()
-        if (this._inProgrammaticSwitch)
-            return;
+            this._lastKnownIM = current;
 
-        // Feature B: Persist the new IM for the focused window
-        const win = global.display.focus_window;
-        if (!win || win.get_window_type() !== Meta.WindowType.NORMAL) {
-            this._dbg(`poll save SKIP: no focused NORMAL window (type=${win ? win.get_window_type() : 'null'})`);
-            return;
-        }
+            // Ignore changes that we ourselves triggered via SetCurrentIM()
+            if (this._inProgrammaticSwitch)
+                return;
 
-        const wmClass = (win.get_wm_class() || '').toLowerCase();
-        if (this._isLauncher(wmClass)) {
-            this._dbg(`poll save SKIP: launcher (wmClass="${wmClass}")`);
-            return;
-        }
+            // Feature B: Persist the new IM for the focused window
+            const win = global.display.focus_window;
+            if (!win || win.get_window_type() !== Meta.WindowType.NORMAL) {
+                this._dbg(`poll save SKIP: no focused NORMAL window (type=${win ? win.get_window_type() : 'null'})`);
+                return;
+            }
 
-        const prev = this._stateMap.get(win.get_id());
-        this._stateMap.set(win.get_id(), current);
-        this._dbg(`poll SAVED win=${win.get_id()} wmClass="${wmClass}" "${prev}" -> "${current}" (stateMap.size=${this._stateMap.size})`);
+            const wmClass = (win.get_wm_class() || '').toLowerCase();
+            if (this._isLauncher(wmClass)) {
+                this._dbg(`poll save SKIP: launcher (wmClass="${wmClass}")`);
+                return;
+            }
+
+            const prev = this._stateMap.get(win.get_id());
+            this._stateMap.set(win.get_id(), current);
+            this._dbg(`poll SAVED win=${win.get_id()} wmClass="${wmClass}" "${prev}" -> "${current}" (stateMap.size=${this._stateMap.size})`);
+        });
     }
 
     // ======================================================================
@@ -354,18 +360,18 @@ export default class Fcitx5WindowStateExtension extends Extension {
                 const target = this._pendingIm;
                 this._pendingIm = null;
 
-                try {
-                    this._dbg(`setIM FIRE "${target}" (inProgrammaticSwitch=true)`);
-                    this._inProgrammaticSwitch = true;
-                    this._proxy.SetCurrentIMSync(target);
-                    this._lastKnownIM = target;
-                    this._dbg(`setIM OK "${target}" lastKnownIM="${this._lastKnownIM}"`);
-                } catch (e) {
-                    this._dbg(`setIM FAIL "${target}": ${e.message}`);
-                    log(`[fcitx5-window-state] SetCurrentIM failed: ${e.message}`);
-                } finally {
+                this._dbg(`setIM FIRE "${target}" (inProgrammaticSwitch=true)`);
+                this._inProgrammaticSwitch = true;
+                this._proxy.SetCurrentIMRemote(target, (result, error) => {
+                    if (error) {
+                        this._dbg(`setIM FAIL "${target}": ${error.message}`);
+                        log(`[fcitx5-window-state] SetCurrentIM failed: ${error.message}`);
+                    } else {
+                        this._lastKnownIM = target;
+                        this._dbg(`setIM OK "${target}" lastKnownIM="${this._lastKnownIM}"`);
+                    }
                     this._inProgrammaticSwitch = false;
-                }
+                });
 
                 return GLib.SOURCE_REMOVE;
             }
