@@ -61,6 +61,7 @@ export default class Fcitx5WindowStateExtension extends Extension {
         this._pollInFlight          = false;
         this._debounceSource        = 0;
         this._pollSource            = 0;
+        this._nameWatcherId         = 0;
         this._signalIds             = [];         // global.display signal handler IDs
         this._overviewWindowId      = null;
 
@@ -105,7 +106,13 @@ export default class Fcitx5WindowStateExtension extends Extension {
             this._pollSource = 0;
         }
 
-        // 5. Release all JS-land references
+        // 5. D-Bus name watcher
+        if (this._nameWatcherId) {
+            Gio.bus_unwatch_name(this._nameWatcherId);
+            this._nameWatcherId = 0;
+        }
+
+        // 6. Release all JS-land references
         this._dbg('DISABLE');
         this._stateMap.clear();
         this._stateMap              = null;
@@ -115,26 +122,23 @@ export default class Fcitx5WindowStateExtension extends Extension {
 
     // ======================================================================
     //  Initialisation
+    //
+    //  We do NOT create the D-Bus proxy synchronously here — that would
+    //  block GNOME Shell's main thread while D-Bus tries to auto-start
+    //  Fcitx5 (which typically isn't running yet at login time).
+    //  Instead we watch for the Fcitx5 bus name to appear asynchronously.
     // ======================================================================
     _init() {
         try {
-            this._proxy = new ControllerProxy(
-                Gio.DBus.session,
+            // Watch Fcitx5 service availability without blocking
+            this._nameWatcherId = Gio.bus_watch_name(
+                Gio.BusType.SESSION,
                 FCITX5_SERVICE,
-                FCITX5_PATH
+                Gio.BusNameWatcherFlags.NONE,
+                (_c, _n, _o) => this._onFcitx5Appeared(),
+                (_c, _n) => this._onFcitx5Vanished()
             );
-            this._dbg('proxy created');
-
-            // Seed _lastKnownIM so the first poll doesn't trigger a false change
-            this._lastKnownIM = DEFAULT_IM;
-            this._proxy.CurrentInputMethodRemote((result, error) => {
-                if (!error) {
-                    this._lastKnownIM = String(result);
-                    this._dbg(`init seed lastKnownIM="${this._lastKnownIM}"`);
-                } else {
-                    this._dbg(`init seed failed: ${error.message}, using "${DEFAULT_IM}"`);
-                }
-            });
+            this._dbg('name watcher started');
 
             // Core hook: window focus changes
             this._signalIds.push(
@@ -156,21 +160,81 @@ export default class Fcitx5WindowStateExtension extends Extension {
             );
             this._dbg('overview signals connected');
 
-            // Periodic polling: the only reliable way to detect IM switches
-            // (Fcitx5's Controller1 has no "current IM changed" signal).
-            this._pollSource = GLib.timeout_add(
-                GLib.PRIORITY_DEFAULT,
-                POLL_INTERVAL_MS,
-                () => {
-                    this._pollCurrentIM();
-                    return GLib.SOURCE_CONTINUE;
-                }
-            );
-            this._dbg('poll timer started');
-
         } catch (e) {
             log(`[fcitx5-window-state] Init failed: ${e.message}`);
         }
+    }
+
+    // Called asynchronously when Fcitx5's D-Bus name appears on the bus.
+    // This may happen well after GNOME Shell has finished starting.
+    _onFcitx5Appeared() {
+        this._dbg('Fcitx5 service appeared — initializing proxy');
+
+        try {
+            // Now that Fcitx5 is running, creating the proxy is fast & safe
+            this._proxy = new ControllerProxy(
+                Gio.DBus.session,
+                FCITX5_SERVICE,
+                FCITX5_PATH
+            );
+            this._dbg('proxy created');
+
+            // Seed _lastKnownIM so the first poll doesn't trigger a false change
+            this._lastKnownIM = DEFAULT_IM;
+            this._proxy.CurrentInputMethodRemote((result, error) => {
+                if (!error) {
+                    this._lastKnownIM = String(result);
+                    this._dbg(`seed lastKnownIM="${this._lastKnownIM}"`);
+                } else {
+                    this._dbg(`seed failed: ${error.message}, using "${DEFAULT_IM}"`);
+                }
+            });
+
+            // Apply cached IM for the currently focused window (if any)
+            const win = global.display.focus_window;
+            if (win &&
+                win.get_window_type() === Meta.WindowType.NORMAL &&
+                this._stateMap.has(win.get_id())) {
+                const cached = this._stateMap.get(win.get_id());
+                this._dbg(`applying cached IM "${cached}" for focused win=${win.get_id()}`);
+                this._setCurrentIM(cached);
+            }
+
+            // Start periodic polling
+            if (!this._pollSource) {
+                this._pollSource = GLib.timeout_add(
+                    GLib.PRIORITY_DEFAULT,
+                    POLL_INTERVAL_MS,
+                    () => {
+                        this._pollCurrentIM();
+                        return GLib.SOURCE_CONTINUE;
+                    }
+                );
+                this._dbg('poll timer started');
+            }
+
+        } catch (e) {
+            log(`[fcitx5-window-state] Fcitx5 appeared init failed: ${e.message}`);
+        }
+    }
+
+    // Called when Fcitx5's D-Bus name disappears (e.g. service restart).
+    _onFcitx5Vanished() {
+        this._dbg('Fcitx5 service vanished — cleaning up proxy');
+
+        if (this._pollSource) {
+            GLib.source_remove(this._pollSource);
+            this._pollSource = 0;
+        }
+        if (this._debounceSource) {
+            GLib.source_remove(this._debounceSource);
+            this._debounceSource = 0;
+        }
+
+        this._proxy = null;
+        this._pollInFlight = false;
+        this._pendingIm = null;
+        this._inProgrammaticSwitch = false;
     }
 
     // ======================================================================
