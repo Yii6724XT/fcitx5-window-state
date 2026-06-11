@@ -1,0 +1,25 @@
+# =============================================================
+#  GNOME Shell Extension — .gitignore
+# =============================================================
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
+
+# 编辑器/IDE
+.idea/
+.vscode/
+*.sublime-*
+.zed/
+
+# docs/ — 学习资料和开发文档
+docs/
+
+# node_modules（如果将来引入 JS 工具链）
+node_modules/
